@@ -1,0 +1,35 @@
+{
+  "name": "dependencies-analyzer",
+  "version": "1.0.0",
+  "description": "Analyse des dépendances JavaScript/TypeScript depuis GitHub",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts"
+  },
+  "bin": {
+    "analyze-deps": "./src/index.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "commander": "^11.0.0",
+    "picocolors": "^1.0.0",
+    "papaparse": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/papaparse": "^5.3.8",
+    "bun-types": "latest"
+  },
+  "keywords": [
+    "dependencies",
+    "analysis",
+    "github",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "module": "index.ts",
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
