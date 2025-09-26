@@ -39,7 +39,7 @@ program
           .toISOString()
           .replace(/[:.]/g, "-")
           .slice(0, -5);
-        config.outputFile = `./dependencies-analysis-${timestamp}.csv`;
+        config.outputFile = `./reports/dependencies-analysis-${timestamp}.csv`;
       }
 
       await analyzeAllDependencies(config);

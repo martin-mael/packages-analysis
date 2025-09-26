@@ -1,174 +1,11 @@
 import * as clack from "@clack/prompts";
 import pc from "picocolors";
-import Papa from "papaparse";
-import { readFile, writeFile, mkdir } from "fs/promises";
-import { dirname } from "path";
-import { CONFIG, type Config } from "./config.js";
-
-interface PackageJson {
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
-}
-
-interface DependencyData {
-  name: string;
-  latest: string;
-  versions: Record<string, string>;
-}
-
-export class GitHubClient {
-  private token: string | null = null;
-  private tokenLoaded: boolean = false;
-
-  constructor() {
-    // Le token sera chargé de manière asynchrone lors de la première utilisation
-  }
-
-  private async loadNpmToken() {
-    if (this.tokenLoaded) return;
-
-    try {
-      const npmrcPath = `${process.env.HOME}/.npmrc`;
-      const file = Bun.file(npmrcPath);
-      const npmrcContent = await file.text();
-      const tokenMatch = npmrcContent.match(
-        /\/\/npm\.pkg\.github\.com\/:_authToken=(.+)/
-      );
-
-      if (tokenMatch) {
-        this.token = tokenMatch[1].trim();
-        console.log(pc.green("✅ Token npm trouvé et chargé"));
-      } else {
-        console.warn(pc.yellow("⚠️  Token npm non trouvé dans ~/.npmrc"));
-      }
-    } catch (error) {
-      console.warn(
-        pc.yellow(
-          `⚠️  Impossible de lire ~/.npmrc: ${(error as Error).message}`
-        )
-      );
-    }
-
-    this.tokenLoaded = true;
-  }
-
-  async fetchPackageJson(
-    repo: string,
-    branch: string
-  ): Promise<PackageJson | null> {
-    await this.loadNpmToken();
-
-    if (!this.token) {
-      throw new Error("Token npm non trouvé dans ~/.npmrc");
-    }
-
-    try {
-      // Utiliser le chemin configuré pour le package.json
-      const packageJsonPath =
-        CONFIG.repoPackageJsonPaths[
-          repo as keyof typeof CONFIG.repoPackageJsonPaths
-        ] || "package.json";
-      const url = `${CONFIG.github.apiBase}/repos/${CONFIG.github.org}/${repo}/contents/${packageJsonPath}?ref=${branch}`;
-      const response = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          Accept: "application/vnd.github.v3+json",
-        },
-      });
-
-      if (!response.ok) {
-        // Essayer avec la branche alternative
-        const alternativeBranch = branch === "master" ? "main" : "master";
-        const alternativeUrl = `${CONFIG.github.apiBase}/repos/${CONFIG.github.org}/${repo}/contents/${packageJsonPath}?ref=${alternativeBranch}`;
-
-        const alternativeResponse = await fetch(alternativeUrl, {
-          headers: {
-            Authorization: `Bearer ${this.token}`,
-            Accept: "application/vnd.github.v3+json",
-          },
-        });
-
-        if (!alternativeResponse.ok) {
-          console.warn(
-            pc.yellow(`⚠️  Impossible de récupérer ${repo}/${packageJsonPath}`)
-          );
-          return null;
-        }
-
-        const alternativeData = await alternativeResponse.json();
-        const content = atob(alternativeData.content);
-        return JSON.parse(content);
-      }
-
-      const data = await response.json();
-      const content = atob(data.content);
-      return JSON.parse(content);
-    } catch (error) {
-      console.warn(
-        pc.yellow(
-          `⚠️  Erreur lors de la récupération de ${repo}: ${
-            (error as Error).message
-          }`
-        )
-      );
-      return null;
-    }
-  }
-
-  async getLatestVersion(packageName: string): Promise<string> {
-    await this.loadNpmToken();
-
-    try {
-      if (packageName.startsWith("@fulll/")) {
-        // Package GitHub privé
-        if (!this.token) return "N/A";
-
-        const packagePath = packageName.replace("@fulll/", "");
-        const url = `${CONFIG.github.apiBase}/orgs/fulll/packages/npm/${packagePath}/versions`;
-
-        const response = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${this.token}`,
-            Accept: "application/vnd.github.v3+json",
-          },
-        });
-
-        if (response.ok) {
-          const versions = await response.json();
-          if (versions.length > 0) {
-            return versions[0].name.replace(/^v/, "");
-          }
-        }
-
-        // Fallback avec npm view si disponible
-        try {
-          const proc = Bun.spawn(["npm", "view", packageName, "version"], {
-            stdout: "pipe",
-            stderr: "pipe",
-          });
-
-          const output = await new Response(proc.stdout).text();
-          return output.trim() || "N/A";
-        } catch {
-          return "N/A";
-        }
-      } else {
-        // Package npm public
-        const url = `${CONFIG.npm.registryBase}/${packageName}/latest`;
-        const response = await fetch(url);
-
-        if (response.ok) {
-          const data = await response.json();
-          return data.version || "N/A";
-        }
-
-        return "N/A";
-      }
-    } catch (error) {
-      return "N/A";
-    }
-  }
-}
+import type { Config } from "./config.js";
+import type { DependencyData, PackageJson } from "./types.js";
+import { cleanOldCaches, loadCache, saveCache } from "./cache.js";
+import { GitHubClient } from "./github-client.js";
+import { analyzeOutdatedPackages } from "./analysis.js";
+import { generateCsvReports, generateMarkdownReport } from "./reports.js";
 
 export async function analyzeAllDependencies(config: Config) {
   const spinner = clack.spinner();
@@ -176,21 +13,80 @@ export async function analyzeAllDependencies(config: Config) {
   try {
     spinner.start("🔧 Initialisation...");
 
-    const github = new GitHubClient();
+    // Nettoyer les anciens caches
+    await cleanOldCaches();
+
+    // Vérifier si un cache existe
+    spinner.message("🔍 Vérification du cache...");
+    let cachedData = await loadCache(config.branch, config.repos);
+
+    let packageJsons: Record<string, PackageJson | null> = {};
+    let latestVersionsCache: Record<string, string> = {};
+
+    if (cachedData) {
+      // Utiliser les données du cache
+      packageJsons = cachedData.packageJsons;
+      latestVersionsCache = cachedData.latestVersions;
+      spinner.message("📦 Utilisation des données en cache...");
+    } else {
+      // Récupérer les données depuis GitHub
+      spinner.message("📦 Récupération des package.json depuis GitHub...");
+
+      const github = new GitHubClient();
+
+      for (const repo of config.repos) {
+        const packageJson = await github.fetchPackageJson(repo, config.branch);
+        packageJsons[repo] = packageJson;
+      }
+
+      // Collecter toutes les dépendances uniques pour préremplir le cache des versions
+      spinner.message("🔍 Collecte des dépendances uniques...");
+      const allDependencies = new Set<string>();
+
+      Object.values(packageJsons).forEach((packageJson) => {
+        if (packageJson?.dependencies) {
+          Object.keys(packageJson.dependencies).forEach((dep) =>
+            allDependencies.add(dep)
+          );
+        }
+      });
+
+      const dependenciesList = Array.from(allDependencies).sort();
+
+      spinner.message(
+        `🌐 Récupération des versions latest (${dependenciesList.length} packages)...`
+      );
+
+      // Récupérer toutes les versions latest pour le cache
+      for (let i = 0; i < dependenciesList.length; i++) {
+        const packageName = dependenciesList[i];
+        spinner.message(
+          `🌐 ${packageName} (${i + 1}/${dependenciesList.length})`
+        );
+
+        const latest = await github.getLatestVersion(packageName);
+        latestVersionsCache[packageName] = latest;
+      }
+
+      // Sauvegarder dans le cache
+      await saveCache(
+        config.branch,
+        config.repos,
+        packageJsons,
+        latestVersionsCache
+      );
+    }
+
+    // Reconstituer le packageJsonCache à partir des données (cache ou fraîches)
     const packageJsonCache = new Map<string, PackageJson>();
-
-    // Récupération de tous les package.json
-    spinner.message("📦 Récupération des package.json depuis GitHub...");
-
-    for (const repo of config.repos) {
-      const packageJson = await github.fetchPackageJson(repo, config.branch);
+    Object.entries(packageJsons).forEach(([repo, packageJson]) => {
       if (packageJson) {
         packageJsonCache.set(repo, packageJson);
       }
-    }
+    });
 
     // Collecte de toutes les dépendances uniques
-    spinner.message("🔍 Collecte des dépendances uniques...");
+    spinner.message("🔍 Analyse des dépendances...");
 
     const allDependencies = new Set<string>();
 
@@ -204,7 +100,9 @@ export async function analyzeAllDependencies(config: Config) {
 
     const dependenciesList = Array.from(allDependencies).sort();
 
-    spinner.message(`📊 Analyse de ${dependenciesList.length} dépendances...`);
+    spinner.message(
+      `📊 Traitement de ${dependenciesList.length} dépendances...`
+    );
 
     // Analyse de chaque dépendance
     const results: DependencyData[] = [];
@@ -213,10 +111,11 @@ export async function analyzeAllDependencies(config: Config) {
       const packageName = dependenciesList[i];
 
       spinner.message(
-        `📊 Analyse de ${packageName} (${i + 1}/${dependenciesList.length})`
+        `📊 ${packageName} (${i + 1}/${dependenciesList.length})`
       );
 
-      const latest = await github.getLatestVersion(packageName);
+      // Utiliser le cache des versions latest
+      const latest = latestVersionsCache[packageName] || "N/A";
       const versions: Record<string, string> = {};
 
       // Récupération des versions pour chaque repo
@@ -245,9 +144,19 @@ export async function analyzeAllDependencies(config: Config) {
 
     await generateCsvReports(results, config.outputFile, config.repos);
 
+    // Analyse des retards et génération du rapport Markdown
+    spinner.message("📋 Analyse des retards et génération du rapport...");
+
+    const analysis = analyzeOutdatedPackages(results, config.repos);
+    const markdownPath = await generateMarkdownReport(
+      analysis,
+      config.outputFile,
+      config.repos
+    );
+
     spinner.stop("✅ Analyse terminée !");
 
-    // Générer les noms des deux fichiers
+    // Générer les noms des fichiers
     const baseFilename = config.outputFile.replace(".csv", "");
     const latestFile = `${baseFilename}-latest.csv`;
     const versionsFile = `${baseFilename}-versions.csv`;
@@ -257,81 +166,78 @@ export async function analyzeAllDependencies(config: Config) {
     console.log(
       pc.green(`📊 ${dependenciesList.length} dépendances analysées`)
     );
-    console.log(pc.blue(`📄 Fichiers CSV générés:`));
+    console.log(pc.blue(`📄 Fichiers générés:`));
     console.log(pc.blue(`   • ${latestFile}`));
     console.log(pc.blue(`   • ${versionsFile}`));
+    console.log(pc.blue(`   • ${markdownPath}`));
+
+    // Affichage des insights
+    if (analysis.outdatedPackages.length > 0) {
+      console.log("");
+      console.log(
+        pc.red(
+          `🚨 ${analysis.outdatedPackages.length} package(s) avec retard critique (≥2 versions majeures)`
+        )
+      );
+      analysis.outdatedPackages.slice(0, 3).forEach((pkg) => {
+        console.log(
+          pc.red(
+            `   • ${pkg.name} (${pkg.majorVersionsBehind} versions de retard)`
+          )
+        );
+      });
+    }
+
+    if (analysis.laggingApps.length > 0) {
+      console.log("");
+      console.log(
+        pc.yellow(
+          `🐌 ${analysis.laggingApps.length} application(s) particulièrement en retard`
+        )
+      );
+      analysis.laggingApps.slice(0, 3).forEach((app) => {
+        console.log(
+          pc.yellow(
+            `   • ${app.displayName} (${app.outdatedPackages.length} packages obsolètes)`
+          )
+        );
+      });
+    }
+
+    if (analysis.archivedPackages.length > 0) {
+      console.log("");
+      console.log(
+        pc.red(
+          `⚠️  ALERTE CRITIQUE: ${analysis.archivedPackages.length} package(s) archivé(s) @fulll encore utilisé(s)`
+        )
+      );
+      analysis.archivedPackages.slice(0, 3).forEach((pkg) => {
+        console.log(
+          pc.red(`   • ${pkg.name} (${pkg.appsUsing.length} applications)`)
+        );
+      });
+    }
+
+    if (
+      analysis.outdatedPackages.length === 0 &&
+      analysis.laggingApps.length === 0 &&
+      analysis.archivedPackages.length === 0
+    ) {
+      console.log("");
+      console.log(
+        pc.green(
+          "🎉 Excellent ! Aucun retard critique ou package archivé détecté."
+        )
+      );
+    }
+
     console.log("");
     console.log(pc.dim("💡 Commandes pour ouvrir les fichiers:"));
+    console.log(pc.dim(`   open "${markdownPath}"`));
     console.log(pc.dim(`   open "${latestFile}"`));
     console.log(pc.dim(`   open "${versionsFile}"`));
-    console.log(pc.dim(`   open -a "Microsoft Excel" "${latestFile}"`));
-    console.log(pc.dim(`   open -a "Microsoft Excel" "${versionsFile}"`));
   } catch (error) {
     spinner.stop("❌ Erreur lors de l'analyse");
     throw error;
   }
-}
-
-async function generateCsvReports(
-  results: DependencyData[],
-  outputPath: string,
-  repos: string[]
-) {
-  // Créer le répertoire de sortie si nécessaire
-  await mkdir(dirname(outputPath), { recursive: true });
-
-  const baseFilename = outputPath.replace(".csv", "");
-  const latestFile = `${baseFilename}-latest.csv`;
-  const versionsFile = `${baseFilename}-versions.csv`;
-
-  // === FICHIER 1: Versions Latest ===
-  const latestData = results.map((result) => ({
-    Package: result.name,
-    Latest: result.latest,
-  }));
-
-  const latestCsv = Papa.unparse(latestData, {
-    columns: ["Package", "Latest"],
-    header: true,
-  });
-
-  // Ajouter le BOM UTF-8 pour Excel
-  const latestCsvWithBom = "\uFEFF" + latestCsv;
-  await writeFile(latestFile, latestCsvWithBom, "utf8");
-
-  // === FICHIER 2: Versions par Repo ===
-  // Générer les en-têtes dynamiquement
-  const versionHeaders = ["Package"];
-  repos.forEach((repo) => {
-    const displayName =
-      CONFIG.repoDisplayNames[repo as keyof typeof CONFIG.repoDisplayNames] ||
-      repo;
-    versionHeaders.push(displayName);
-  });
-
-  // Préparer les données pour le CSV des versions
-  const versionData = results.map((result) => {
-    const row: Record<string, string> = {
-      Package: result.name,
-    };
-
-    repos.forEach((repo) => {
-      const displayName =
-        CONFIG.repoDisplayNames[repo as keyof typeof CONFIG.repoDisplayNames] ||
-        repo;
-      row[displayName] = result.versions[repo] || "-";
-    });
-
-    return row;
-  });
-
-  // Générer le CSV des versions
-  const versionsCsv = Papa.unparse(versionData, {
-    columns: versionHeaders,
-    header: true,
-  });
-
-  // Ajouter le BOM UTF-8 pour Excel
-  const versionsCsvWithBom = "\uFEFF" + versionsCsv;
-  await writeFile(versionsFile, versionsCsvWithBom, "utf8");
 }
